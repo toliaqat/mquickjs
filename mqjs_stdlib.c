@@ -43,6 +43,12 @@ static const JSPropDef js_object[] = {
     JS_CFUNC_DEF("setPrototypeOf", 2, js_object_setPrototypeOf),
     JS_CFUNC_DEF("create", 2, js_object_create),
     JS_CFUNC_DEF("keys", 1, js_object_keys),
+    JS_CFUNC_DEF("preventExtensions", 1, js_object_preventExtensions),
+    JS_CFUNC_DEF("isExtensible", 1, js_object_isExtensible),
+    JS_CFUNC_DEF("seal", 1, js_object_seal),
+    JS_CFUNC_DEF("isSealed", 1, js_object_isSealed),
+    JS_CFUNC_DEF("freeze", 1, js_object_freeze),
+    JS_CFUNC_DEF("isFrozen", 1, js_object_isFrozen),
     JS_PROP_END,
 };
 
@@ -373,6 +379,8 @@ static const JSPropDef js_global_object[] = {
     JS_CFUNC_DEF("eval", 1, js_global_eval),
     JS_CFUNC_DEF("isNaN", 1, js_global_isNaN ),
     JS_CFUNC_DEF("isFinite", 1, js_global_isFinite ),
+    JS_CFUNC_DEF("harden", 1, js_harden ),
+    JS_CFUNC_DEF("lockdown", 0, js_lockdown ),
 
     JS_PROP_DOUBLE_DEF("Infinity", 1.0 / 0.0, 0 ),
     JS_PROP_DOUBLE_DEF("NaN", NAN, 0 ),

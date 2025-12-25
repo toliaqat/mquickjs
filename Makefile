@@ -123,6 +123,7 @@ test: mqjs example
 	./mqjs tests/test_loop.js
 	./mqjs tests/test_builtin.js
 	./mqjs tests/test_compartment.js
+	./mqjs tests/test_harden_lockdown.js
 # test bytecode generation and loading
 	./mqjs -o test_builtin.bin tests/test_builtin.js
 #	@sha256sum -c test_builtin.sha256

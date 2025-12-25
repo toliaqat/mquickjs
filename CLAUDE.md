@@ -133,6 +133,50 @@ Strict mode only (ES5 subset with extensions):
 - Date: only `Date.now()` supported
 - String case functions: ASCII only
 
+## Security Features (SES/Hardened JavaScript)
+
+MQuickJS implements core security primitives from Hardened JavaScript (SES):
+
+### Object Immutability
+- `Object.freeze(obj)` - Make object and its properties immutable
+- `Object.seal(obj)` - Prevent adding/removing properties
+- `Object.preventExtensions(obj)` - Prevent adding new properties
+- `Object.isFrozen/isSealed/isExtensible(obj)` - Check object state
+
+### harden(obj)
+Transitively freezes an object and all objects reachable from it:
+```javascript
+var api = harden({
+    greet: function(name) { return "Hello, " + name; },
+    config: { version: "1.0" }
+});
+// api, api.greet, and api.config are all now frozen
+```
+
+### lockdown()
+Freezes all JavaScript intrinsics to prevent prototype pollution attacks:
+```javascript
+lockdown();  // Call once at startup
+
+// Now these throw TypeError:
+Object.prototype.evil = function() {};  // Cannot modify
+Array.prototype.push = null;            // Cannot modify
+```
+
+Key behaviors:
+- Can only be called once per context (throws TypeError on second call)
+- Affects all Compartments (they share intrinsics)
+- User-created objects remain mutable after lockdown
+- Normal code continues to work (creating objects, arrays, using methods)
+
+### Compartments
+Isolated JavaScript execution environments with shared intrinsics:
+```javascript
+var c = new Compartment({ globals: { x: 1 } });
+c.evaluate("x + 1");  // 2
+c.globalThis.x;       // 1
+```
+
 ## Tests
 
 Test files in `tests/`:
@@ -140,5 +184,7 @@ Test files in `tests/`:
 - `test_closure.js` - Closure tests
 - `test_loop.js` - Loop construct tests
 - `test_builtin.js` - Builtin function tests
+- `test_compartment.js` - Compartment isolation tests
+- `test_harden_lockdown.js` - Security primitives (freeze/seal/harden/lockdown)
 - `test_rect.js` - C API example test
 - `microbench.js` - Performance microbenchmarks

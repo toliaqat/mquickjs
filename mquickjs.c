@@ -221,6 +221,7 @@ struct JSContext {
     uint16_t class_count; /* number of classes including user classes */
     int16_t interrupt_counter;
     BOOL current_exception_is_uncatchable : 8;
+    BOOL locked_down : 8; /* lockdown() has been called */
     struct JSParseState *parse_state; /* != NULL during JS_Eval() */
     int unique_strings_len;
     int js_call_rec_count; /* number of recursing JS_Call() */
@@ -321,10 +322,17 @@ typedef struct {
     void *opaque;
 } JSObjectUserData;
 
+/* Object flags for freeze/seal/preventExtensions */
+#define JS_OBJ_FLAG_EXTENSIBLE   0x01  /* Can add new properties (default ON) */
+#define JS_OBJ_FLAG_SEALED       0x02  /* Cannot add/delete/reconfigure props */
+#define JS_OBJ_FLAG_FROZEN       0x04  /* Sealed + all data props read-only */
+#define JS_OBJ_FLAG_HARDENED     0x08  /* Transitively frozen (for harden()) */
+
 struct JSObject {
     JS_MB_HEADER;
     JSWord class_id: 8;
-    JSWord extra_size: JS_MB_PAD(JS_MTAG_BITS + 8);  /* object additional size, in JSValue */
+    JSWord obj_flags: 4;  /* Object state flags (extensible, sealed, frozen, hardened) */
+    JSWord extra_size: JS_MB_PAD(JS_MTAG_BITS + 8 + 4);  /* object additional size, in JSValue */
 
     JSValue proto; /* JSObject or JS_NULL */
     /* JSValueArray. structure:
@@ -2370,6 +2378,7 @@ static JSObject *JS_NewObjectProtoClass1(JSContext *ctx, JSValue proto,
     if (!p)
         return NULL;
     p->class_id = class_id;
+    p->obj_flags = JS_OBJ_FLAG_EXTENSIBLE;  /* Objects are extensible by default */
     p->extra_size = extra_size;
     p->proto = proto;
     p->props = ctx->empty_props;
@@ -2981,8 +2990,12 @@ static JSValue JS_DefinePropertyInternal(JSContext *ctx, JSValue obj,
         return JS_EXCEPTION;
     
     if (flags & JS_DEF_PROP_FLAGS_LOOKUP) {
-        pr = find_own_property(ctx, JS_VALUE_TO_PTR(obj), prop);
+        JSObject *p = JS_VALUE_TO_PTR(obj);
+        pr = find_own_property(ctx, p, prop);
         if (pr) {
+            /* Check frozen state for data properties */
+            if ((p->obj_flags & JS_OBJ_FLAG_FROZEN) && prop_type == JS_PROP_NORMAL)
+                return JS_ThrowTypeError(ctx, "Cannot assign to read only property '%"JSValue_PRI"'", prop);
             if (pr->prop_type != prop_type)
                 return JS_ThrowTypeError(ctx, "cannot modify getter/setter/value kind");
             switch(prop_type) {
@@ -3002,6 +3015,9 @@ static JSValue JS_DefinePropertyInternal(JSContext *ctx, JSValue obj,
             }
             return pr->value;
         }
+        /* Check extensibility before creating new property */
+        if (!(p->obj_flags & JS_OBJ_FLAG_EXTENSIBLE))
+            return JS_ThrowTypeError(ctx, "Cannot add property '%"JSValue_PRI"', object is not extensible", prop);
     }
 
     if (prop_type == JS_PROP_GETSET) {
@@ -3153,6 +3169,9 @@ static JSValue JS_SetPropertyInternal(JSContext *ctx, JSValue this_obj,
             /* not standard: we refuse to add properties to object
                except at the last position */
             if (idx < p->u.array.len) {
+                /* Check if array is frozen */
+                if (p->obj_flags & JS_OBJ_FLAG_FROZEN)
+                    return JS_ThrowTypeError(ctx, "Cannot assign to read only property '%d'", idx);
                 arr = JS_VALUE_TO_PTR(p->u.array.tab);
                 arr->arr[idx] = val;
                 return JS_UNDEFINED;
@@ -3160,6 +3179,9 @@ static JSValue JS_SetPropertyInternal(JSContext *ctx, JSValue this_obj,
                 JSValue new_tab;
                 JSGCRef this_obj_ref, val_ref;
 
+                /* Check if array is extensible (can add elements) */
+                if (!(p->obj_flags & JS_OBJ_FLAG_EXTENSIBLE))
+                    return JS_ThrowTypeError(ctx, "Cannot add property '%d', object is not extensible", idx);
                 JS_PUSH_VALUE(ctx, this_obj);
                 JS_PUSH_VALUE(ctx, val);
                 new_tab = js_resize_value_array(ctx, p->u.array.tab, idx + 1);
@@ -3250,6 +3272,9 @@ static JSValue JS_SetPropertyInternal(JSContext *ctx, JSValue this_obj,
         if (likely(pr->prop_type == JS_PROP_NORMAL)) {
             if (unlikely(JS_IS_ROM_PTR(ctx, pr)))
                 goto convert_to_ram;
+            /* Check if object is frozen */
+            if (p->obj_flags & JS_OBJ_FLAG_FROZEN)
+                return JS_ThrowTypeError(ctx, "Cannot assign to read only property '%"JSValue_PRI"'", prop);
             pr->value = val;
             return JS_UNDEFINED;
         } else if (pr->prop_type == JS_PROP_VARREF) {
@@ -3328,6 +3353,12 @@ static JSValue JS_SetPropertyInternal(JSContext *ctx, JSValue this_obj,
     /* add the property in the object */
     if (!is_obj)
         return JS_ThrowTypeErrorNotAnObject(ctx);
+    /* Check extensibility before adding new property */
+    {
+        JSObject *pobj = JS_VALUE_TO_PTR(this_obj);
+        if (!(pobj->obj_flags & JS_OBJ_FLAG_EXTENSIBLE))
+            return JS_ThrowTypeError(ctx, "Cannot add property '%"JSValue_PRI"', object is not extensible", prop);
+    }
     return JS_DefinePropertyInternal(ctx, this_obj, prop, val, JS_UNDEFINED,
                                      this_obj == ctx->global_obj ? JS_PROP_VARREF : JS_PROP_NORMAL, 0);
 }
@@ -3382,6 +3413,10 @@ static JSValue JS_DeleteProperty(JSContext *ctx, JSValue this_obj,
     p = JS_VALUE_TO_PTR(this_obj);
     if (p->mtag != JS_MTAG_OBJECT)
         return JS_TRUE;
+
+    /* Check if object is sealed or frozen - cannot delete properties */
+    if (p->obj_flags & (JS_OBJ_FLAG_SEALED | JS_OBJ_FLAG_FROZEN))
+        return JS_ThrowTypeError(ctx, "Cannot delete property '%"JSValue_PRI"' of sealed object", prop);
 
     arr = JS_VALUE_TO_PTR(p->props);
     hash_mask = JS_VALUE_GET_INT(arr->arr[1]);
@@ -5934,6 +5969,9 @@ JSValue JS_Call(JSContext *ctx, int call_flags)
                     /* XXX: slow */
                     if (unlikely(JS_IS_ROM_PTR(ctx, pr)))
                         goto put_field_slow;
+                    /* Check if object is frozen */
+                    if (unlikely(p->obj_flags & JS_OBJ_FLAG_FROZEN))
+                        goto put_field_slow;
                     pr->value = sp[0];
                     sp += 2;
                 } else {
@@ -6015,9 +6053,15 @@ JSValue JS_Call(JSContext *ctx, int call_flags)
                         goto put_array_el_slow;
                     if (unlikely(p->class_id != JS_CLASS_ARRAY))
                         goto put_array_el_slow;
+                    /* Check for frozen/sealed array */
+                    if (unlikely(p->obj_flags & JS_OBJ_FLAG_FROZEN))
+                        goto put_array_el_slow;
                     idx = JS_VALUE_GET_INT(prop);
                     arr = JS_VALUE_TO_PTR(p->u.array.tab);
                     if (unlikely(idx >= p->u.array.len)) {
+                        /* Adding new element - check extensibility */
+                        if (unlikely(!(p->obj_flags & JS_OBJ_FLAG_EXTENSIBLE)))
+                            goto put_array_el_slow;
                         if (idx == p->u.array.len &&
                             p->u.array.tab != JS_NULL &&
                             idx < arr->size) {
@@ -13846,6 +13890,265 @@ JSValue js_object_hasOwnProperty(JSContext *ctx, JSValue *this_val,
     return JS_NewBool((find_own_property(ctx, p, prop) != NULL));
 }
 
+/* Object.preventExtensions(obj) - prevents new properties from being added */
+JSValue js_object_preventExtensions(JSContext *ctx, JSValue *this_val,
+                                    int argc, JSValue *argv)
+{
+    JSObject *p;
+    JSValue obj = argv[0];
+
+    /* Non-objects are returned as-is (ES6 behavior) */
+    if (!JS_IsObject(ctx, obj))
+        return obj;
+
+    p = JS_VALUE_TO_PTR(obj);
+    p->obj_flags &= ~JS_OBJ_FLAG_EXTENSIBLE;
+    return obj;
+}
+
+/* Object.isExtensible(obj) - returns true if new properties can be added */
+JSValue js_object_isExtensible(JSContext *ctx, JSValue *this_val,
+                               int argc, JSValue *argv)
+{
+    JSObject *p;
+    JSValue obj = argv[0];
+
+    /* Non-objects are not extensible (ES6 behavior) */
+    if (!JS_IsObject(ctx, obj))
+        return JS_FALSE;
+
+    p = JS_VALUE_TO_PTR(obj);
+    return JS_NewBool((p->obj_flags & JS_OBJ_FLAG_EXTENSIBLE) != 0);
+}
+
+/* Object.seal(obj) - prevents adding/deleting properties */
+JSValue js_object_seal(JSContext *ctx, JSValue *this_val,
+                       int argc, JSValue *argv)
+{
+    JSObject *p;
+    JSValue obj = argv[0];
+
+    /* Non-objects are returned as-is (ES6 behavior) */
+    if (!JS_IsObject(ctx, obj))
+        return obj;
+
+    p = JS_VALUE_TO_PTR(obj);
+    p->obj_flags &= ~JS_OBJ_FLAG_EXTENSIBLE;
+    p->obj_flags |= JS_OBJ_FLAG_SEALED;
+    return obj;
+}
+
+/* Object.isSealed(obj) - returns true if object is sealed */
+JSValue js_object_isSealed(JSContext *ctx, JSValue *this_val,
+                           int argc, JSValue *argv)
+{
+    JSObject *p;
+    JSValue obj = argv[0];
+
+    /* Non-objects are vacuously sealed (ES6 behavior) */
+    if (!JS_IsObject(ctx, obj))
+        return JS_TRUE;
+
+    p = JS_VALUE_TO_PTR(obj);
+    /* Sealed means non-extensible. Empty non-extensible objects are sealed. */
+    if (p->obj_flags & JS_OBJ_FLAG_EXTENSIBLE)
+        return JS_FALSE;
+    /* If explicitly sealed or frozen, it's sealed */
+    if (p->obj_flags & (JS_OBJ_FLAG_SEALED | JS_OBJ_FLAG_FROZEN))
+        return JS_TRUE;
+    /* Non-extensible object with no properties is considered sealed */
+    {
+        JSValueArray *arr = JS_VALUE_TO_PTR(p->props);
+        int prop_count = JS_VALUE_GET_INT(arr->arr[0]);
+        if (prop_count == 0 && p->class_id != JS_CLASS_ARRAY)
+            return JS_TRUE;
+    }
+    return JS_FALSE;
+}
+
+/* Object.freeze(obj) - makes object completely immutable */
+JSValue js_object_freeze(JSContext *ctx, JSValue *this_val,
+                         int argc, JSValue *argv)
+{
+    JSObject *p;
+    JSValue obj = argv[0];
+
+    /* Non-objects are returned as-is (ES6 behavior) */
+    if (!JS_IsObject(ctx, obj))
+        return obj;
+
+    p = JS_VALUE_TO_PTR(obj);
+    p->obj_flags &= ~JS_OBJ_FLAG_EXTENSIBLE;
+    p->obj_flags |= JS_OBJ_FLAG_SEALED | JS_OBJ_FLAG_FROZEN;
+    return obj;
+}
+
+/* Object.isFrozen(obj) - returns true if object is frozen */
+JSValue js_object_isFrozen(JSContext *ctx, JSValue *this_val,
+                           int argc, JSValue *argv)
+{
+    JSObject *p;
+    JSValue obj = argv[0];
+
+    /* Non-objects are vacuously frozen (ES6 behavior) */
+    if (!JS_IsObject(ctx, obj))
+        return JS_TRUE;
+
+    p = JS_VALUE_TO_PTR(obj);
+    /* Frozen means non-extensible. Empty non-extensible objects are frozen. */
+    if (p->obj_flags & JS_OBJ_FLAG_EXTENSIBLE)
+        return JS_FALSE;
+    /* If explicitly frozen, it's frozen */
+    if (p->obj_flags & JS_OBJ_FLAG_FROZEN)
+        return JS_TRUE;
+    /* Non-extensible object with no properties is considered frozen */
+    {
+        JSValueArray *arr = JS_VALUE_TO_PTR(p->props);
+        int prop_count = JS_VALUE_GET_INT(arr->arr[0]);
+        if (prop_count == 0 && p->class_id != JS_CLASS_ARRAY)
+            return JS_TRUE;
+    }
+    return JS_FALSE;
+}
+
+/* Internal helper to recursively harden an object and its reachable graph */
+static JSValue js_harden_internal(JSContext *ctx, JSValue obj)
+{
+    JSObject *p;
+    JSValueArray *props_arr;
+    int prop_count, hash_mask, i, j;
+    JSProperty *pr;
+
+    /* Non-objects pass through */
+    if (!JS_IsObject(ctx, obj))
+        return obj;
+
+    p = JS_VALUE_TO_PTR(obj);
+
+    /* Already hardened - fast path (also prevents cycles) */
+    if (p->obj_flags & JS_OBJ_FLAG_HARDENED)
+        return obj;
+
+    /* Mark as hardened first to handle circular references */
+    p->obj_flags |= JS_OBJ_FLAG_HARDENED;
+
+    /* Freeze the object */
+    p->obj_flags &= ~JS_OBJ_FLAG_EXTENSIBLE;
+    p->obj_flags |= JS_OBJ_FLAG_SEALED | JS_OBJ_FLAG_FROZEN;
+
+    /* Harden the prototype */
+    if (p->proto != JS_NULL) {
+        JSGCRef obj_ref;
+        JS_PUSH_VALUE(ctx, obj);
+        js_harden_internal(ctx, p->proto);
+        JS_POP_VALUE(ctx, obj);
+        p = JS_VALUE_TO_PTR(obj);  /* Refresh pointer after potential GC */
+    }
+
+    /* Harden array elements if this is an array */
+    if (p->class_id == JS_CLASS_ARRAY && p->u.array.tab != JS_NULL) {
+        JSValueArray *arr = JS_VALUE_TO_PTR(p->u.array.tab);
+        int len = p->u.array.len;
+        for (i = 0; i < len; i++) {
+            JSGCRef obj_ref;
+            JS_PUSH_VALUE(ctx, obj);
+            js_harden_internal(ctx, arr->arr[i]);
+            JS_POP_VALUE(ctx, obj);
+            p = JS_VALUE_TO_PTR(obj);
+            arr = JS_VALUE_TO_PTR(p->u.array.tab);
+        }
+    }
+
+    /* Harden all property values */
+    props_arr = JS_VALUE_TO_PTR(p->props);
+    prop_count = JS_VALUE_GET_INT(props_arr->arr[0]);
+    hash_mask = JS_VALUE_GET_INT(props_arr->arr[1]);
+
+    for (i = 0, j = 0; j < prop_count; i++) {
+        pr = (JSProperty *)&props_arr->arr[2 + hash_mask + 1 + 3 * i];
+        if (pr->key != JS_UNINITIALIZED) {
+            JSGCRef obj_ref;
+            if (pr->prop_type == JS_PROP_NORMAL) {
+                /* Harden the property value */
+                JS_PUSH_VALUE(ctx, obj);
+                js_harden_internal(ctx, pr->value);
+                JS_POP_VALUE(ctx, obj);
+                p = JS_VALUE_TO_PTR(obj);
+                props_arr = JS_VALUE_TO_PTR(p->props);
+            } else if (pr->prop_type == JS_PROP_GETSET) {
+                /* Harden getter and setter */
+                JSValueArray *gs_arr = JS_VALUE_TO_PTR(pr->value);
+                JS_PUSH_VALUE(ctx, obj);
+                js_harden_internal(ctx, gs_arr->arr[0]);  /* getter */
+                JS_POP_VALUE(ctx, obj);
+                p = JS_VALUE_TO_PTR(obj);
+                props_arr = JS_VALUE_TO_PTR(p->props);
+                pr = (JSProperty *)&props_arr->arr[2 + hash_mask + 1 + 3 * i];
+                gs_arr = JS_VALUE_TO_PTR(pr->value);
+
+                JS_PUSH_VALUE(ctx, obj);
+                js_harden_internal(ctx, gs_arr->arr[1]);  /* setter */
+                JS_POP_VALUE(ctx, obj);
+                p = JS_VALUE_TO_PTR(obj);
+                props_arr = JS_VALUE_TO_PTR(p->props);
+            }
+            j++;
+        }
+    }
+
+    return obj;
+}
+
+/* harden(obj) - Transitively freeze an object and all reachable objects */
+JSValue js_harden(JSContext *ctx, JSValue *this_val,
+                  int argc, JSValue *argv)
+{
+    JSValue obj = argv[0];
+
+    /* Non-objects pass through unchanged */
+    if (!JS_IsObject(ctx, obj))
+        return obj;
+
+    return js_harden_internal(ctx, obj);
+}
+
+/* lockdown() - Freeze all intrinsics to prevent prototype pollution */
+JSValue js_lockdown(JSContext *ctx, JSValue *this_val,
+                    int argc, JSValue *argv)
+{
+    int i;
+    JSValue val;
+
+    /* Check if already locked down */
+    if (ctx->locked_down) {
+        return JS_ThrowTypeError(ctx, "lockdown() can only be called once");
+    }
+
+    /* Set the flag first to prevent re-entry */
+    ctx->locked_down = TRUE;
+
+    /* Harden all class prototypes */
+    for (i = 0; i < ctx->class_count; i++) {
+        val = ctx->class_proto[i];
+        if (JS_IsObject(ctx, val)) {
+            js_harden_internal(ctx, val);
+        }
+    }
+
+    /* Harden all class constructors/objects */
+    for (i = 0; i < ctx->class_count; i++) {
+        val = ctx->class_obj[i];
+        if (JS_IsObject(ctx, val)) {
+            js_harden_internal(ctx, val);
+        }
+    }
+
+    /* Harden the global object */
+    js_harden_internal(ctx, ctx->global_obj);
+
+    return JS_UNDEFINED;
+}
+
 JSValue js_object_toString(JSContext *ctx, JSValue *this_val,
                            int argc, JSValue *argv)
 {
@@ -14105,10 +14408,13 @@ JSValue js_array_push(JSContext *ctx, JSValue *this_val,
     int new_len, i, from;
     JSValueArray *arr;
     JSValue new_tab;
-    
+
     p = js_get_array(ctx, *this_val);
     if (!p)
         return JS_EXCEPTION;
+    /* Check if array is frozen or not extensible */
+    if (!(p->obj_flags & JS_OBJ_FLAG_EXTENSIBLE))
+        return JS_ThrowTypeError(ctx, "Cannot add elements, array is not extensible");
     from = p->u.array.len;
     new_len = from + argc;
     if (new_len > JS_SHORTINT_MAX)
@@ -14135,10 +14441,13 @@ JSValue js_array_pop(JSContext *ctx, JSValue *this_val,
 {
     JSObject *p;
     JSValue ret;
-    
+
     p = js_get_array(ctx, *this_val);
     if (!p)
         return JS_EXCEPTION;
+    /* Check if array is sealed or frozen - cannot remove elements */
+    if (p->obj_flags & (JS_OBJ_FLAG_SEALED | JS_OBJ_FLAG_FROZEN))
+        return JS_ThrowTypeError(ctx, "Cannot remove elements from sealed/frozen array");
     if (p->u.array.len > 0) {
         JSValueArray *arr = JS_VALUE_TO_PTR(p->u.array.tab);
         ret = arr->arr[--p->u.array.len];
@@ -14153,10 +14462,13 @@ JSValue js_array_shift(JSContext *ctx, JSValue *this_val,
 {
     JSObject *p;
     JSValue ret;
-    
+
     p = js_get_array(ctx, *this_val);
     if (!p)
         return JS_EXCEPTION;
+    /* Check if array is sealed or frozen - cannot remove elements */
+    if (p->obj_flags & (JS_OBJ_FLAG_SEALED | JS_OBJ_FLAG_FROZEN))
+        return JS_ThrowTypeError(ctx, "Cannot remove elements from sealed/frozen array");
     if (p->u.array.len > 0) {
         JSValueArray *arr = JS_VALUE_TO_PTR(p->u.array.tab);
         ret = arr->arr[0];
@@ -14246,6 +14558,9 @@ JSValue js_array_reverse(JSContext *ctx, JSValue *this_val,
     p = js_get_array(ctx, *this_val);
     if (!p)
         return JS_EXCEPTION;
+    /* Check if array is frozen - cannot reorder elements */
+    if (p->obj_flags & JS_OBJ_FLAG_FROZEN)
+        return JS_ThrowTypeError(ctx, "Cannot modify frozen array");
     len = p->u.array.len;
     arr = JS_VALUE_TO_PTR(p->u.array.tab);
     js_reverse_val(arr->arr, len);
@@ -14391,10 +14706,13 @@ JSValue js_array_splice(JSContext *ctx, JSValue *this_val,
     JSValueArray *arr, *arr1;
     JSValue obj;
     JSGCRef obj_ref;
-    
+
     p = js_get_array(ctx, *this_val);
     if (!p)
         return JS_EXCEPTION;
+    /* Check if array is frozen or sealed - splice modifies array */
+    if (p->obj_flags & (JS_OBJ_FLAG_SEALED | JS_OBJ_FLAG_FROZEN))
+        return JS_ThrowTypeError(ctx, "Cannot splice sealed/frozen array");
     len = p->u.array.len;
 
     if (JS_ToInt32Clamp(ctx, &start, argv[0], 0, len, len))
@@ -14772,6 +15090,9 @@ JSValue js_array_sort(JSContext *ctx, JSValue *this_val,
     p = js_get_array(ctx, *this_val);
     if (!p)
         return JS_EXCEPTION;
+    /* Check if array is frozen - cannot reorder elements */
+    if (p->obj_flags & JS_OBJ_FLAG_FROZEN)
+        return JS_ThrowTypeError(ctx, "Cannot sort frozen array");
 
     /* create a temporary array for sorting */
     len = p->u.array.len;
@@ -18338,6 +18659,8 @@ static void js_compartment_add_intrinsics(JSContext *ctx, JSValue global_obj)
     js_copy_global_property(ctx, global_obj, "NaN");
     js_copy_global_property(ctx, global_obj, "Infinity");
     js_copy_global_property(ctx, global_obj, "undefined");
+    js_copy_global_property(ctx, global_obj, "harden");
+    js_copy_global_property(ctx, global_obj, "lockdown");
 
     /* globalThis self-reference */
     js_set_global_varref(ctx, global_obj, "globalThis", global_obj);
