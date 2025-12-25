@@ -18260,6 +18260,16 @@ static void js_set_global_varref(JSContext *ctx, JSValue global_obj,
     }
 }
 
+/* Copy a property from main global to compartment global as VARREF */
+static void js_copy_global_property(JSContext *ctx, JSValue comp_global,
+                                     const char *name)
+{
+    JSValue val = JS_GetPropertyStr(ctx, ctx->global_obj, name);
+    if (!JS_IsUndefined(val) && !JS_IsException(val)) {
+        js_set_global_varref(ctx, comp_global, name, val);
+    }
+}
+
 /* Add standard intrinsics to compartment's global object */
 static void js_compartment_add_intrinsics(JSContext *ctx, JSValue global_obj)
 {
@@ -18295,6 +18305,20 @@ static void js_compartment_add_intrinsics(JSContext *ctx, JSValue global_obj)
 
     /* Compartment constructor for nested compartments */
     js_set_global_varref(ctx, global_obj, "Compartment", ctx->class_obj[JS_CLASS_COMPARTMENT]);
+
+    /* Copy singleton objects from main global */
+    js_copy_global_property(ctx, global_obj, "Math");
+    js_copy_global_property(ctx, global_obj, "JSON");
+
+    /* Copy global functions from main global */
+    js_copy_global_property(ctx, global_obj, "parseInt");
+    js_copy_global_property(ctx, global_obj, "parseFloat");
+    js_copy_global_property(ctx, global_obj, "isNaN");
+    js_copy_global_property(ctx, global_obj, "isFinite");
+    js_copy_global_property(ctx, global_obj, "eval");
+    js_copy_global_property(ctx, global_obj, "NaN");
+    js_copy_global_property(ctx, global_obj, "Infinity");
+    js_copy_global_property(ctx, global_obj, "undefined");
 
     /* globalThis self-reference */
     js_set_global_varref(ctx, global_obj, "globalThis", global_obj);
