@@ -1,0 +1,20 @@
+# Object files
+*.o
+*.d
+
+HARDEN_LOCKDOWN_IMPLEMENTATION_GUIDE.md
+COMPARTMENT_IMPLEMENTATION_GUIDE.md
+
+# Generated headers
+mqjs_stdlib.h
+mquickjs_atom.h
+example_stdlib.h
+
+# Executables
+mqjs
+example
+mqjs_stdlib
+example_stdlib
+
+# Test artifacts
+test_builtin.bin
