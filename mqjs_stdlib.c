@@ -309,6 +309,16 @@ static const JSPropDef js_date[] = {
 static const JSClassDef js_date_class =
     JS_CLASS_DEF("Date", 7, js_date_constructor, JS_CLASS_DATE, js_date, NULL, NULL, NULL);
 
+/* Compartment */
+static const JSPropDef js_compartment_proto[] = {
+    JS_CGETSET_DEF("globalThis", js_compartment_get_globalThis, NULL),
+    JS_CFUNC_DEF("evaluate", 1, js_compartment_evaluate),
+    JS_PROP_END,
+};
+
+static const JSClassDef js_compartment_class =
+    JS_CLASS_DEF("Compartment", 1, js_compartment_constructor, JS_CLASS_COMPARTMENT, NULL, js_compartment_proto, NULL, NULL);
+
 static const JSPropDef js_console[] = {
     JS_CFUNC_DEF("log", 1, js_print),
     JS_PROP_END,
@@ -355,6 +365,8 @@ static const JSPropDef js_global_object[] = {
     JS_PROP_CLASS_DEF("Uint32Array", &js_Uint32Array_class),
     JS_PROP_CLASS_DEF("Float32Array", &js_Float32Array_class),
     JS_PROP_CLASS_DEF("Float64Array", &js_Float64Array_class),
+
+    JS_PROP_CLASS_DEF("Compartment", &js_compartment_class),
 
     JS_CFUNC_DEF("parseInt", 2, js_number_parseInt ),
     JS_CFUNC_DEF("parseFloat", 1, js_number_parseFloat ),

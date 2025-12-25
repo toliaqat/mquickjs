@@ -313,6 +313,11 @@ typedef struct {
 } JSRegExp;
 
 typedef struct {
+    JSValue global_obj;        /* compartment's own global object */
+    JSValue global_lexicals;   /* object holding lexical bindings or JS_NULL */
+} JSCompartmentData;
+
+typedef struct {
     void *opaque;
 } JSObjectUserData;
 
@@ -338,6 +343,7 @@ struct JSObject {
         JSArrayBuffer array_buffer;
         JSTypedArray typed_array;
         JSRegExp regexp;
+        JSCompartmentData compartment;
         JSObjectUserData user;
     } u;
 };
@@ -11944,6 +11950,10 @@ static void gc_mark_flush(GCMarkState *s)
                     gc_mark(s, p->u.regexp.source);
                     gc_mark(s, p->u.regexp.byte_code);
                     break;
+                case JS_CLASS_COMPARTMENT:
+                    gc_mark(s, p->u.compartment.global_obj);
+                    gc_mark(s, p->u.compartment.global_lexicals);
+                    break;
                 }
             }
             break;
@@ -18190,4 +18200,249 @@ JSValue js_string_search(JSContext *ctx, JSValue *this_val,
                          int argc, JSValue *argv)
 {
     return js_regexp_exec(ctx, &argv[0], 1, this_val, MAGIC_REGEXP_SEARCH);
+}
+
+/**********************************************************************/
+/* Compartment */
+
+/* Copy properties as global variables (with VARREF type for compartment globals) */
+static JSValue js_copy_properties_as_globals(JSContext *ctx, JSValue dst, JSValue src)
+{
+    JSValue keys, prop, val, res;
+    JSObject *p;
+    JSValueArray *arr;
+    int i, len;
+    JSGCRef keys_ref, dst_ref;
+
+    keys = js_object_keys(ctx, NULL, 1, &src);
+    if (JS_IsException(keys))
+        return JS_EXCEPTION;
+
+    JS_PUSH_VALUE(ctx, keys);
+    JS_PUSH_VALUE(ctx, dst);
+
+    p = JS_VALUE_TO_PTR(keys);
+    len = p->u.array.len;
+    arr = JS_VALUE_TO_PTR(p->u.array.tab);
+
+    for (i = 0; i < len; i++) {
+        prop = JS_ToPropertyKey(ctx, arr->arr[i]);
+        val = JS_GetProperty(ctx, src, prop);
+        if (JS_IsException(val)) {
+            JS_POP_VALUE(ctx, dst);
+            JS_POP_VALUE(ctx, keys);
+            return JS_EXCEPTION;
+        }
+        /* Use JS_PROP_VARREF so globals work correctly in compartment */
+        res = JS_DefinePropertyInternal(ctx, dst, prop, val, JS_NULL,
+                                        JS_PROP_VARREF, 0);
+        if (JS_IsException(res)) {
+            JS_POP_VALUE(ctx, dst);
+            JS_POP_VALUE(ctx, keys);
+            return JS_EXCEPTION;
+        }
+    }
+
+    JS_POP_VALUE(ctx, dst);
+    JS_POP_VALUE(ctx, keys);
+    return JS_UNDEFINED;
+}
+
+/* Set a property as a global VARREF (for compartment globals) */
+static void js_set_global_varref(JSContext *ctx, JSValue global_obj,
+                                  const char *name, JSValue val)
+{
+    JSValue prop = JS_NewString(ctx, name);
+    if (!JS_IsException(prop)) {
+        prop = JS_ToPropertyKey(ctx, prop);
+        JS_DefinePropertyInternal(ctx, global_obj, prop, val, JS_NULL,
+                                  JS_PROP_VARREF, 0);
+    }
+}
+
+/* Add standard intrinsics to compartment's global object */
+static void js_compartment_add_intrinsics(JSContext *ctx, JSValue global_obj)
+{
+    /* Add references to built-in constructors */
+    /* These share prototypes with the main context */
+    js_set_global_varref(ctx, global_obj, "Object", ctx->class_obj[JS_CLASS_OBJECT]);
+    js_set_global_varref(ctx, global_obj, "Array", ctx->class_obj[JS_CLASS_ARRAY]);
+    js_set_global_varref(ctx, global_obj, "Function", ctx->class_obj[JS_CLASS_CLOSURE]);
+    js_set_global_varref(ctx, global_obj, "Number", ctx->class_obj[JS_CLASS_NUMBER]);
+    js_set_global_varref(ctx, global_obj, "Boolean", ctx->class_obj[JS_CLASS_BOOLEAN]);
+    js_set_global_varref(ctx, global_obj, "String", ctx->class_obj[JS_CLASS_STRING]);
+    js_set_global_varref(ctx, global_obj, "Error", ctx->class_obj[JS_CLASS_ERROR]);
+    js_set_global_varref(ctx, global_obj, "EvalError", ctx->class_obj[JS_CLASS_EVAL_ERROR]);
+    js_set_global_varref(ctx, global_obj, "RangeError", ctx->class_obj[JS_CLASS_RANGE_ERROR]);
+    js_set_global_varref(ctx, global_obj, "ReferenceError", ctx->class_obj[JS_CLASS_REFERENCE_ERROR]);
+    js_set_global_varref(ctx, global_obj, "SyntaxError", ctx->class_obj[JS_CLASS_SYNTAX_ERROR]);
+    js_set_global_varref(ctx, global_obj, "TypeError", ctx->class_obj[JS_CLASS_TYPE_ERROR]);
+    js_set_global_varref(ctx, global_obj, "URIError", ctx->class_obj[JS_CLASS_URI_ERROR]);
+    js_set_global_varref(ctx, global_obj, "RegExp", ctx->class_obj[JS_CLASS_REGEXP]);
+    js_set_global_varref(ctx, global_obj, "Date", ctx->class_obj[JS_CLASS_DATE]);
+    js_set_global_varref(ctx, global_obj, "ArrayBuffer", ctx->class_obj[JS_CLASS_ARRAY_BUFFER]);
+
+    /* Typed arrays */
+    js_set_global_varref(ctx, global_obj, "Uint8ClampedArray", ctx->class_obj[JS_CLASS_UINT8C_ARRAY]);
+    js_set_global_varref(ctx, global_obj, "Int8Array", ctx->class_obj[JS_CLASS_INT8_ARRAY]);
+    js_set_global_varref(ctx, global_obj, "Uint8Array", ctx->class_obj[JS_CLASS_UINT8_ARRAY]);
+    js_set_global_varref(ctx, global_obj, "Int16Array", ctx->class_obj[JS_CLASS_INT16_ARRAY]);
+    js_set_global_varref(ctx, global_obj, "Uint16Array", ctx->class_obj[JS_CLASS_UINT16_ARRAY]);
+    js_set_global_varref(ctx, global_obj, "Int32Array", ctx->class_obj[JS_CLASS_INT32_ARRAY]);
+    js_set_global_varref(ctx, global_obj, "Uint32Array", ctx->class_obj[JS_CLASS_UINT32_ARRAY]);
+    js_set_global_varref(ctx, global_obj, "Float32Array", ctx->class_obj[JS_CLASS_FLOAT32_ARRAY]);
+    js_set_global_varref(ctx, global_obj, "Float64Array", ctx->class_obj[JS_CLASS_FLOAT64_ARRAY]);
+
+    /* Compartment constructor for nested compartments */
+    js_set_global_varref(ctx, global_obj, "Compartment", ctx->class_obj[JS_CLASS_COMPARTMENT]);
+
+    /* globalThis self-reference */
+    js_set_global_varref(ctx, global_obj, "globalThis", global_obj);
+}
+
+JSValue js_compartment_constructor(JSContext *ctx, JSValue *this_val,
+                                   int argc, JSValue *argv)
+{
+    JSValue comp, glob, options, globals, global_lexicals;
+    JSObject *p;
+    JSGCRef comp_ref, glob_ref;
+
+    argc &= ~FRAME_CF_CTOR;
+
+    /* Create compartment object */
+    comp = JS_NewObjectClass(ctx, JS_CLASS_COMPARTMENT,
+                             sizeof(JSCompartmentData));
+    if (JS_IsException(comp))
+        return JS_EXCEPTION;
+
+    JS_PUSH_VALUE(ctx, comp);
+
+    /* Create new global object for this compartment */
+    glob = JS_NewObject(ctx);
+    if (JS_IsException(glob)) {
+        JS_POP_VALUE(ctx, comp);
+        return JS_EXCEPTION;
+    }
+
+    JS_PUSH_VALUE(ctx, glob);
+
+    /* Initialize compartment data */
+    p = JS_VALUE_TO_PTR(comp);
+    p->u.compartment.global_obj = glob;
+    p->u.compartment.global_lexicals = JS_NULL;
+
+    /* Add standard intrinsics to compartment's global */
+    js_compartment_add_intrinsics(ctx, glob);
+
+    /* Process options if provided */
+    if (argc >= 1 && JS_IsObject(ctx, argv[0])) {
+        options = argv[0];
+
+        /* Handle globals option */
+        globals = JS_GetPropertyStr(ctx, options, "globals");
+        if (!JS_IsUndefined(globals) && !JS_IsNull(globals)) {
+            if (!JS_IsObject(ctx, globals)) {
+                JS_POP_VALUE(ctx, glob);
+                JS_POP_VALUE(ctx, comp);
+                return JS_ThrowTypeError(ctx, "globals must be an object");
+            }
+            /* Copy properties from globals to glob (as VARREF globals) */
+            if (JS_IsException(js_copy_properties_as_globals(ctx, glob, globals))) {
+                JS_POP_VALUE(ctx, glob);
+                JS_POP_VALUE(ctx, comp);
+                return JS_EXCEPTION;
+            }
+        }
+
+        /* Handle globalLexicals option */
+        global_lexicals = JS_GetPropertyStr(ctx, options, "globalLexicals");
+        if (!JS_IsUndefined(global_lexicals) && !JS_IsNull(global_lexicals)) {
+            if (!JS_IsObject(ctx, global_lexicals)) {
+                JS_POP_VALUE(ctx, glob);
+                JS_POP_VALUE(ctx, comp);
+                return JS_ThrowTypeError(ctx, "globalLexicals must be an object");
+            }
+            /* Store lexicals for later use during evaluate */
+            p = JS_VALUE_TO_PTR(comp);
+            p->u.compartment.global_lexicals = global_lexicals;
+        }
+    }
+
+    JS_POP_VALUE(ctx, glob);
+    JS_POP_VALUE(ctx, comp);
+    return comp;
+}
+
+JSValue js_compartment_get_globalThis(JSContext *ctx, JSValue *this_val,
+                                      int argc, JSValue *argv)
+{
+    JSObject *p;
+
+    if (!JS_IsObject(ctx, *this_val))
+        return JS_ThrowTypeError(ctx, "not a Compartment");
+
+    p = JS_VALUE_TO_PTR(*this_val);
+    if (p->class_id != JS_CLASS_COMPARTMENT)
+        return JS_ThrowTypeError(ctx, "not a Compartment");
+
+    return p->u.compartment.global_obj;
+}
+
+JSValue js_compartment_evaluate(JSContext *ctx, JSValue *this_val,
+                                int argc, JSValue *argv)
+{
+    JSObject *p;
+    JSValue saved_global, result, source, lexicals;
+    const char *source_str;
+    size_t source_len;
+    JSCStringBuf buf;
+    JSGCRef saved_global_ref;
+
+    if (!JS_IsObject(ctx, *this_val))
+        return JS_ThrowTypeError(ctx, "not a Compartment");
+
+    p = JS_VALUE_TO_PTR(*this_val);
+    if (p->class_id != JS_CLASS_COMPARTMENT)
+        return JS_ThrowTypeError(ctx, "not a Compartment");
+
+    /* Validate argument is a string */
+    if (argc < 1)
+        return JS_UNDEFINED;
+
+    source = argv[0];
+    if (!JS_IsString(ctx, source))
+        return JS_ThrowTypeError(ctx, "evaluate requires a string argument");
+
+    source_str = JS_ToCStringLen(ctx, &source_len, source, &buf);
+    if (!source_str)
+        return JS_EXCEPTION;
+
+    /* Handle empty string */
+    if (source_len == 0)
+        return JS_UNDEFINED;
+
+    /* Save current global object */
+    saved_global = ctx->global_obj;
+    JS_PUSH_VALUE(ctx, saved_global);
+
+    /* Get compartment's global (p might have moved after JS_PUSH_VALUE) */
+    p = JS_VALUE_TO_PTR(*this_val);
+
+    /* Temporarily swap to compartment's global */
+    ctx->global_obj = p->u.compartment.global_obj;
+
+    /* Get lexicals (may be null) */
+    lexicals = p->u.compartment.global_lexicals;
+
+    /* Evaluate in compartment context */
+    /* Note: globalLexicals are stored but accessing them as true lexicals
+       would require parser changes. For now, evaluate without lexical support. */
+    (void)lexicals; /* TODO: implement proper lexical scoping */
+    result = JS_Eval(ctx, source_str, source_len, "<compartment>", JS_EVAL_RETVAL);
+
+    /* Restore original global */
+    ctx->global_obj = saved_global;
+    JS_POP_VALUE(ctx, saved_global);
+
+    return result;
 }

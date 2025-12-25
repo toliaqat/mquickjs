@@ -261,4 +261,12 @@ JSValue js_regexp_get_flags(JSContext *ctx, JSValue *this_val,
 JSValue js_regexp_exec(JSContext *ctx, JSValue *this_val,
                        int argc, JSValue *argv, int is_test);
 
+/* Compartment */
+JSValue js_compartment_constructor(JSContext *ctx, JSValue *this_val,
+                                   int argc, JSValue *argv);
+JSValue js_compartment_get_globalThis(JSContext *ctx, JSValue *this_val,
+                                      int argc, JSValue *argv);
+JSValue js_compartment_evaluate(JSContext *ctx, JSValue *this_val,
+                                int argc, JSValue *argv);
+
 #endif /* MICROJS_PRIV_H */

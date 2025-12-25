@@ -121,6 +121,8 @@ typedef enum {
     JS_CLASS_FLOAT32_ARRAY,
     JS_CLASS_FLOAT64_ARRAY,
 
+    JS_CLASS_COMPARTMENT,
+
     JS_CLASS_USER, /* user classes start from this value */
 } JSObjectClassEnum;
 
