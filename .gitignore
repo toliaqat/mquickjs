@@ -2,9 +2,6 @@
 *.o
 *.d
 
-HARDEN_LOCKDOWN_IMPLEMENTATION_GUIDE.md
-COMPARTMENT_IMPLEMENTATION_GUIDE.md
-
 # Generated headers
 mqjs_stdlib.h
 mquickjs_atom.h
