@@ -18412,15 +18412,60 @@ JSValue js_compartment_get_globalThis(JSContext *ctx, JSValue *this_val,
     return p->u.compartment.global_obj;
 }
 
+/* Build IIFE wrapper for lexicals: (function(key1,key2,...){return(SOURCE);}) */
+static JSValue js_build_lexical_wrapper(JSContext *ctx, const char *source,
+                                         size_t source_len, int num_lexicals,
+                                         JSValueArray *keys_arr)
+{
+    /* Calculate buffer size - estimate key names at ~20 chars each */
+    size_t wrapper_len = source_len + (size_t)num_lexicals * 24 + 40;
+    char *wrapper;
+    char *wp;
+    int i;
+    JSValue func;
+    JSCStringBuf key_buf;
+
+    /* Use stack buffer for reasonable sizes */
+    char stack_buf[2048];
+    if (wrapper_len <= sizeof(stack_buf)) {
+        wrapper = stack_buf;
+    } else {
+        return JS_ThrowInternalError(ctx, "source too large for lexical wrapping");
+    }
+
+    /* Build wrapper: (function(key1,key2,...){return(SOURCE);}) */
+    wp = wrapper;
+    wp += sprintf(wp, "(function(");
+    for (i = 0; i < num_lexicals; i++) {
+        const char *key_str;
+        size_t key_len;
+        if (i > 0) *wp++ = ',';
+        key_str = JS_ToCStringLen(ctx, &key_len, keys_arr->arr[i], &key_buf);
+        if (key_str) {
+            memcpy(wp, key_str, key_len);
+            wp += key_len;
+        }
+    }
+    wp += sprintf(wp, "){return(");
+    memcpy(wp, source, source_len);
+    wp += source_len;
+    wp += sprintf(wp, ");})");
+
+    /* Evaluate wrapper to get function */
+    func = JS_Eval(ctx, wrapper, (size_t)(wp - wrapper), "<lexical-wrapper>", JS_EVAL_RETVAL);
+    return func;
+}
+
 JSValue js_compartment_evaluate(JSContext *ctx, JSValue *this_val,
                                 int argc, JSValue *argv)
 {
     JSObject *p;
-    JSValue saved_global, result, source, lexicals;
+    JSValue saved_global, result, source, lexicals, keys, func;
     const char *source_str;
     size_t source_len;
     JSCStringBuf buf;
-    JSGCRef saved_global_ref;
+    JSGCRef saved_global_ref, func_ref;
+    int num_lexicals, i, err;
 
     if (!JS_IsObject(ctx, *this_val))
         return JS_ThrowTypeError(ctx, "not a Compartment");
@@ -18455,13 +18500,67 @@ JSValue js_compartment_evaluate(JSContext *ctx, JSValue *this_val,
     /* Temporarily swap to compartment's global */
     ctx->global_obj = p->u.compartment.global_obj;
 
-    /* Get lexicals (may be null) */
+    /* Get lexicals */
     lexicals = p->u.compartment.global_lexicals;
 
-    /* Evaluate in compartment context */
-    /* Note: globalLexicals are stored but accessing them as true lexicals
-       would require parser changes. For now, evaluate without lexical support. */
-    (void)lexicals; /* TODO: implement proper lexical scoping */
+    /* Check if we have lexicals to wrap */
+    if (!JS_IsNull(lexicals) && JS_IsObject(ctx, lexicals)) {
+        /* Get keys from lexicals */
+        keys = js_object_keys(ctx, NULL, 1, &lexicals);
+        if (JS_IsException(keys)) {
+            ctx->global_obj = saved_global;
+            JS_POP_VALUE(ctx, saved_global);
+            return JS_EXCEPTION;
+        }
+
+        p = JS_VALUE_TO_PTR(keys);
+        num_lexicals = p->u.array.len;
+
+        if (num_lexicals > 0) {
+            JSValueArray *arr = JS_VALUE_TO_PTR(p->u.array.tab);
+
+            /* Build wrapper function with actual key names */
+            func = js_build_lexical_wrapper(ctx, source_str, source_len, num_lexicals, arr);
+            if (JS_IsException(func)) {
+                ctx->global_obj = saved_global;
+                JS_POP_VALUE(ctx, saved_global);
+                return JS_EXCEPTION;
+            }
+
+            JS_PUSH_VALUE(ctx, func);
+
+            /* Stack check for args + func + this */
+            err = JS_StackCheck(ctx, (uint32_t)(num_lexicals + 2));
+            if (err) {
+                JS_POP_VALUE(ctx, func);
+                ctx->global_obj = saved_global;
+                JS_POP_VALUE(ctx, saved_global);
+                return JS_ThrowInternalError(ctx, "stack overflow");
+            }
+
+            /* Push lexical values in reverse order */
+            for (i = num_lexicals - 1; i >= 0; i--) {
+                JSValue key = arr->arr[i];
+                JSValue val = JS_GetProperty(ctx, lexicals, key);
+                JS_PushArg(ctx, val);
+            }
+
+            /* Push function and this (null) */
+            JS_PushArg(ctx, func);
+            JS_PushArg(ctx, JS_NULL);
+
+            /* Call the wrapper function */
+            result = JS_Call(ctx, num_lexicals);
+
+            JS_POP_VALUE(ctx, func);
+            ctx->global_obj = saved_global;
+            JS_POP_VALUE(ctx, saved_global);
+            return result;
+        }
+        /* Fall through to direct eval if no lexicals */
+    }
+
+    /* No lexicals - direct evaluation */
     result = JS_Eval(ctx, source_str, source_len, "<compartment>", JS_EVAL_RETVAL);
 
     /* Restore original global */

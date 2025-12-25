@@ -145,12 +145,12 @@ function test_globals_option() {
 
 // ============================================================
 // Test 5: globalLexicals Option
-// NOTE: True lexical scoping requires parser changes in MicroQuickJS.
-// globalLexicals constructor option is accepted but not functional.
+// Implemented via IIFE wrapping - code is wrapped in a function
+// that receives lexicals as parameters.
 // ============================================================
 
 function test_globalLexicals_option() {
-    // Constructor accepts globalLexicals without error
+    // 5.1 globalLexicals provides lexical bindings
     var c = new Compartment({
         globalLexicals: {
             letVar: 10,
@@ -158,12 +158,40 @@ function test_globalLexicals_option() {
         }
     });
 
-    // Verify constructor works - globalLexicals stored but not functional
-    assert(c.globalThis !== undefined, true, "compartment created with globalLexicals");
+    assert(c.evaluate("letVar"), 10, "lexical letVar");
+    assert(c.evaluate("constVar"), 20, "lexical constVar");
 
-    // Note: Full globalLexicals behavior (lexical bindings not on globalThis)
-    // would require parser changes in MicroQuickJS.
-    // For now, only globals option provides variable access.
+    // 5.2 lexicals are NOT on globalThis
+    assert(c.evaluate("typeof globalThis.letVar"), "undefined", "lexical not on globalThis");
+
+    // 5.3 lexicals shadow globals with same name
+    var c2 = new Compartment({
+        globals: { x: 1 },
+        globalLexicals: { x: 2 }
+    });
+    assert(c2.evaluate("x"), 2, "lexical shadows global");
+    assert(c2.globalThis.x, 1, "global x still on globalThis");
+
+    // 5.4 lexicals with functions
+    var callCount = 0;
+    var c3 = new Compartment({
+        globalLexicals: {
+            callback: function() { callCount++; return 42; }
+        }
+    });
+    assert(c3.evaluate("callback()"), 42, "lexical function callable");
+    assert(callCount, 1, "lexical function was called");
+
+    // 5.5 lexicals work with expressions
+    var c4 = new Compartment({
+        globalLexicals: { a: 5, b: 3 }
+    });
+    assert(c4.evaluate("a + b"), 8, "lexicals in expression");
+    assert(c4.evaluate("a * b"), 15, "lexicals in multiplication");
+
+    // 5.6 empty globalLexicals
+    var c5 = new Compartment({ globalLexicals: {} });
+    assert(c5.evaluate("1 + 1"), 2, "empty globalLexicals");
 }
 
 // ============================================================
