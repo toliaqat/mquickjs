@@ -297,26 +297,30 @@ function test_builtin_globals() {
 function test_this_binding() {
     var c = new Compartment();
 
-    // 5.1 this at top-level in compartment evaluate is null (MicroQuickJS behavior)
-    assert(c.evaluate("this"), null, "this is null at top level in compartment");
+    // 5.1 this at top-level in compartment evaluate (without lexicals) is null
+    assert(c.evaluate("this"), null, "this is null at top level without lexicals");
 
-    // 5.2 this in regular function call returns undefined in MicroQuickJS
+    // 5.2 this with globalLexicals is globalThis (IIFE uses globalThis as this)
+    var c2 = new Compartment({ globalLexicals: { x: 1 } });
+    assert(c2.evaluate("this") === c2.globalThis, true, "this is globalThis with lexicals");
+
+    // 5.3 this in regular function call returns undefined in MicroQuickJS
     c.evaluate("function getThis() { return this; }");
     var fnThis = c.evaluate("getThis()");
     assert(fnThis, undefined, "this in function call is undefined");
 
-    // 5.3 this in method call
+    // 5.4 this in method call
     c.evaluate("var obj = { getThis: function() { return this; } }");
     assert(c.evaluate("obj.getThis() === obj"), true, "this in method is receiver");
 
-    // 5.4 Explicit this binding with call
+    // 5.5 Explicit this binding with call
     c.evaluate("function showX() { return this.x; }");
     assert(c.evaluate("showX.call({x: 42})"), 42, "call with explicit this");
 
-    // 5.5 Explicit this binding with apply (MicroQuickJS requires array arg)
+    // 5.6 Explicit this binding with apply (MicroQuickJS requires array arg)
     assert(c.evaluate("showX.apply({x: 99}, [])"), 99, "apply with explicit this");
 
-    // 5.6 bind
+    // 5.7 bind
     c.evaluate("var bound = showX.bind({x: 123})");
     assert(c.evaluate("bound()"), 123, "bound function");
 }

@@ -18203,7 +18203,26 @@ JSValue js_string_search(JSContext *ctx, JSValue *this_val,
 }
 
 /**********************************************************************/
-/* Compartment */
+/* Compartment - TC39 Compartments (minimal implementation)
+ *
+ * Provides isolated JavaScript execution environments with:
+ * - Separate globalThis per compartment
+ * - Shared intrinsics (Array.prototype, Object.prototype, etc.)
+ * - globals option: properties copied to compartment's globalThis
+ * - globalLexicals option: variables accessible but not on globalThis
+ *   (implemented via IIFE wrapping)
+ *
+ * Usage:
+ *   var c = new Compartment({ globals: { x: 1 }, globalLexicals: { y: 2 } });
+ *   c.evaluate("x + y");  // 3
+ *   c.globalThis.x;       // 1
+ *   c.globalThis.y;       // undefined (lexical, not on globalThis)
+ *
+ * Limitations:
+ * - No module system (import/importNow not implemented)
+ * - globalLexicals are mutable (not const-like for non-writable props)
+ * - Large source + many lexicals limited by stack buffer
+ */
 
 /* Copy properties as global variables (with VARREF type for compartment globals) */
 static JSValue js_copy_properties_as_globals(JSContext *ctx, JSValue dst, JSValue src)
@@ -18545,9 +18564,9 @@ JSValue js_compartment_evaluate(JSContext *ctx, JSValue *this_val,
                 JS_PushArg(ctx, val);
             }
 
-            /* Push function and this (null) */
+            /* Push function and this (compartment's globalThis) */
             JS_PushArg(ctx, func);
-            JS_PushArg(ctx, JS_NULL);
+            JS_PushArg(ctx, ctx->global_obj);
 
             /* Call the wrapper function */
             result = JS_Call(ctx, num_lexicals);
